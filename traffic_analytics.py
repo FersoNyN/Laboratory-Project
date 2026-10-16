@@ -1,17 +1,7 @@
 #Using streamlit, pandas and plotly, where pandas handles the summary tables, plotly generates interactive charts, and streamlit displays the interface on the browser.
 #To run: py -m streamlit run traffic_analytics.py
-"""Z-ENG traffic analytics, stage 1: overall summaries.
-
-Install in your project environment:
-    python -m pip install "streamlit>=1.53,<2" pandas plotly "psycopg[binary]>=3.2,<4"
-Run:
-    python -m streamlit run traffic_analytics.py
-
-Reads dataset labels from network_flows; does not create predictions or alerts.
-"""
 
 from datetime import datetime
-
 import pandas as pd
 import plotly.express as px
 import psycopg
@@ -19,26 +9,20 @@ import streamlit as st
 
 
 LABEL_SUMMARY_SQL = """
-SELECT original_label,
-       COUNT(*) AS flow_count,
-       MIN(observed_at) AS first_seen,
-       MAX(observed_at) AS last_seen
-FROM network_flows
-GROUP BY original_label
-ORDER BY flow_count DESC, original_label
+SELECT original_label, COUNT(*) AS flow_count, MIN(observed_at) AS first_seen, MAX(observed_at) AS last_seen
+FROM network_flows GROUP BY original_label ORDER BY flow_count DESC, original_label
 """
 
 IMPORT_SUMMARY_SQL = """
 SELECT id AS batch_id, source_file, row_count
-FROM import_batches
-ORDER BY id
+FROM import_batches ORDER BY id
 """
 
-COLORS = {"Benign": "#268b83", "Labeled attack": "#d26743", "Unlabeled": "#8995a7"}
+COLORS = {"Benign": "#0e9e13", "Labeled attack": "#8a0f1b", "Unlabeled": "#474747"}
 
 
 def prepare_label_summary(records):
-    """Calculate percentages from aggregated counts; keep missing labels visible."""
+    # Calculate percentages 
     frame = pd.DataFrame(
         records, columns=["original_label", "flow_count", "first_seen", "last_seen"]
     )
@@ -48,8 +32,7 @@ def prepare_label_summary(records):
         return frame
 
     frame["flow_count"] = frame["flow_count"].astype("int64")
-    # Preserve the source label for inspection/export. Normalize only to identify
-    # BENIGN. Every other nonempty CIC-IDS2017 label is an attack category.
+    # Preserve the source label for inspection and export and normalize only to identify BENIGN as anyother label is an attack category
     labels = frame["original_label"].fillna("").astype(str).str.strip()
     frame["traffic_class"] = labels.map(
         lambda value: "Unlabeled" if not value else
@@ -61,7 +44,6 @@ def prepare_label_summary(records):
 
 
 def load_summaries(host, port, database, username, password):
-    """Fetch small SQL aggregates using a consistent, read-only transaction."""
     with psycopg.connect(
         host=host, port=port, dbname=database, user=username, password=password,
         connect_timeout=10, application_name="zeng_traffic_analytics",
@@ -80,7 +62,6 @@ def load_summaries(host, port, database, username, password):
 
 
 def render_overview(labels, imports):
-    """Render all cards, charts and tables from one database snapshot."""
     if labels.empty or int(labels["flow_count"].sum()) == 0:
         st.info("The database is connected, but network_flows contains no traffic yet.")
         return
@@ -98,22 +79,12 @@ def render_overview(labels, imports):
     columns[2].metric("Labeled attack flows", f"{attacks:,}")
     columns[3].metric("Attack share of all flows", f"{attacks / total:.2%}")
     st.caption(
-        f"Benign share: {benign / total:.2%}  |  "
-        f"Imported files: {len(imports):,}  |  "
-        f"Attack share counts flow records, not unique incidents or attackers."
+        f"Benign share: {benign / total:.2%}"
     )
     if unknown:
         st.warning(
-            f"{unknown:,} flows have missing or empty labels. They are shown as "
+            f"{unknown:,}. Flows have missing or empty labels. They are shown as "
             "unlabeled and are included in the total, but not counted as attacks."
-        )
-
-    dates = pd.to_datetime(labels["first_seen"], errors="coerce")
-    ends = pd.to_datetime(labels["last_seen"], errors="coerce")
-    if dates.notna().any() and ends.notna().any():
-        st.caption(
-            f"Capture period: {dates.min():%d %b %Y, %H:%M} to "
-            f"{ends.max():%d %b %Y, %H:%M}. Times use the CSV's original wall time."
         )
 
     st.divider()
@@ -157,7 +128,6 @@ def render_overview(labels, imports):
                 yaxis=dict(categoryorder="array", categoryarray=attack_labels["display_label"].tolist()),
             )
             st.plotly_chart(figure, width="stretch")
-        st.caption("A logarithmic scale makes rare categories easier to compare.")
 
     st.subheader("All source labels")
     table = labels[["original_label", "traffic_class", "flow_count", "percentage"]].copy()
@@ -168,66 +138,56 @@ def render_overview(labels, imports):
     table.columns = ["Source label", "Traffic class", "Flows", "Share of all flows (%)"]
     st.dataframe(table, hide_index=True, width="stretch")
     st.download_button(
-        "Download label summary (CSV)",
+        "Download All source labels (CSV)",
         table.to_csv(index=False).encode("utf-8-sig"),
         file_name="zeng_label_summary.csv", mime="text/csv",
     )
 
     with st.expander("Imported files and query details"):
         st.dataframe(imports, hide_index=True, width="stretch")
-        recorded = int(imports["row_count"].sum()) if not imports.empty else 0
-        if recorded != total:
-            st.warning(
-                f"Import batches record {recorded:,} flows, while the traffic table "
-                f"contains {total:,}. Investigate the difference before reporting totals."
-            )
-        st.caption("Only grouped counts and capture bounds are loaded into Python.")
-        st.code(LABEL_SUMMARY_SQL.strip(), language="sql")
 
-
+# DONE
 def main():
-    st.set_page_config(page_title="Z-ENG | Traffic overview", page_icon="Z", layout="wide")
-    st.caption("Z-ENG / NETWORK TRAFFIC ANALYTICS")
-    st.title("Traffic overview")
-    st.write("Explore the labeled CIC-IDS2017 traffic stored in PostgreSQL.")
-    st.info("These charts use the dataset's original labels. Model predictions will be added later.")
+    # Main page display config 
+    st.set_page_config(page_title="Network Traffic Overview", page_icon="Z")
+    st.caption("Z-ENG: Network Intrusion Detection and Security Analytics Dashboard")
+    st.title("Network Traffic Overview")
+    
+    #TODO: currently we use the dataset's original labels, model predictions to be added later :)
 
     with st.sidebar:
-        st.header("Database connection")
+        st.header("Connect to the Database")
         with st.form("database_connection"):
+            # TODO: Decide if leaving already declared values or remove all (or only pswrd) for security?
             host = st.text_input("Host", value="localhost")
             port = st.number_input("Port", min_value=1, max_value=65535, value=5432)
-            database = st.text_input("Database", value="zeng_security")
+            database = st.text_input("Database name", value="zeng_security")
             username = st.text_input("Username", value="postgres")
-            password = st.text_input("Password", type="password")
-            submitted = st.form_submit_button("Connect / refresh data")
-        st.caption("Queries are read-only. Enter the PostgreSQL password you used for the importer.")
+            password = st.text_input("Password", type="password", value="holahola") 
+            submitted = st.form_submit_button("Connect")
 
     if submitted:
         st.session_state.pop("analytics_result", None)
         try:
-            with st.spinner("Calculating traffic summaries in PostgreSQL..."):
+            # Appears while loading the database first
+            with st.spinner("Calculating summaries in the database..."):
                 labels, imports = load_summaries(host, int(port), database, username, password)
             st.session_state["analytics_result"] = {
                 "labels": labels, "imports": imports,
                 "loaded_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
                 "target": f"{database} on {host}:{int(port)}",
             }
-        except psycopg.errors.UndefinedTable:
-            st.error("The required tables were not found. Check that the database is zeng_security and the schema was created.")
-        except psycopg.errors.QueryCanceled:
-            st.error("The summary query exceeded two minutes. Retry when the database is less busy.")
+        # If the data for connecting to the database was not correct throw an error:
         except psycopg.OperationalError:
-            st.error("Could not connect. Check the host, port, username and password, and confirm PostgreSQL is running.")
-        except psycopg.Error as exc:
-            st.error(f"PostgreSQL could not complete the query (SQLSTATE {exc.sqlstate or 'unavailable'}).")
+            st.error("Error: Check data submmited for the database connection.")
 
     result = st.session_state.get("analytics_result")
     if result is None:
-        st.write("Enter your database connection details in the sidebar, then select **Connect / refresh data**.")
+        st.write("Enter your database connection details in the sidebar, then click **Connect**.")
         return
 
-    st.caption(f"Source: {result['target']}  |  Last refresh: {result['loaded_at']} (local computer time)")
+    st.caption(f"Database source: {result['target']}")
+
     render_overview(result["labels"], result["imports"])
 
 
