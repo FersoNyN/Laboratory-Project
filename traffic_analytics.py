@@ -43,24 +43,6 @@ def prepare_label_summary(records):
     return frame
 
 
-def load_summaries(host, port, database, username, password):
-    with psycopg.connect(
-        host=host, port=port, dbname=database, user=username, password=password,
-        connect_timeout=10, application_name="zeng_traffic_analytics",
-        options="-c statement_timeout=120000",
-    ) as connection:
-        connection.read_only = True
-        connection.isolation_level = psycopg.IsolationLevel.REPEATABLE_READ
-        with connection.cursor() as cursor:
-            cursor.execute(LABEL_SUMMARY_SQL)
-            labels = prepare_label_summary(cursor.fetchall())
-            cursor.execute(IMPORT_SUMMARY_SQL)
-            imports = pd.DataFrame(
-                cursor.fetchall(), columns=["batch_id", "source_file", "row_count"]
-            )
-    return labels, imports
-
-
 def render_overview(labels, imports):
     if labels.empty or int(labels["flow_count"].sum()) == 0:
         st.info("The database is connected, but network_flows contains no traffic yet.")
@@ -146,50 +128,252 @@ def render_overview(labels, imports):
     with st.expander("Imported files and query details"):
         st.dataframe(imports, hide_index=True, width="stretch")
 
-# DONE
+
+# Only these fixed expressions are used in SQL; filter values use parameters.
+TRAFFIC_CLASS_SQL = """CASE
+ WHEN original_label IS NULL OR BTRIM(original_label) = '' THEN 'Unlabeled'
+ WHEN UPPER(BTRIM(original_label)) = 'BENIGN' THEN 'Benign'
+ ELSE 'Labeled attack' END"""
+INTERVALS = {"5 minutes": "5 minutes", "15 minutes": "15 minutes", "1 hour": "1 hour", "1 day": "1 day"}
+PROTOCOLS = {1: "ICMP (1)", 6: "TCP (6)", 17: "UDP (17)"}
+
+
+def connect_database(settings):
+    connection = psycopg.connect(
+        **settings, connect_timeout=10, application_name="zeng_traffic_analytics",
+        options="-c statement_timeout=120000",
+    )
+    connection.read_only = True
+    connection.isolation_level = psycopg.IsolationLevel.REPEATABLE_READ
+    return connection
+
+
+def load_filter_options(settings):
+    with connect_database(settings) as connection, connection.cursor() as cursor:
+        cursor.execute(IMPORT_SUMMARY_SQL)
+        imports = pd.DataFrame(cursor.fetchall(), columns=["batch_id", "source_file", "row_count"])
+        cursor.execute("SELECT DISTINCT protocol FROM network_flows ORDER BY protocol")
+        protocols = [row[0] for row in cursor.fetchall() if row[0] is not None]
+        cursor.execute("SELECT DISTINCT original_label FROM network_flows ORDER BY original_label")
+        labels = [row[0] for row in cursor.fetchall() if row[0] is not None]
+        cursor.execute("SELECT MIN(observed_at), MAX(observed_at) FROM network_flows")
+        bounds = cursor.fetchone()
+    return imports, protocols, labels, bounds
+
+
+def build_where(filters):
+    clauses, parameters = [], []
+    for column, key in [("import_batch_id", "batches"), ("protocol", "protocols"), ("original_label", "labels")]:
+        if filters[key]:
+            clauses.append(f"{column} = ANY(%s)")
+            parameters.append(filters[key])
+    if filters.get("start") is not None:
+        clauses.append("observed_at >= %s")
+        parameters.append(filters["start"])
+    if filters.get("end") is not None:
+        clauses.append("observed_at < %s")
+        parameters.append(filters["end"])
+    if filters.get("port") is not None:
+        clauses.append("destination_port = %s")
+        parameters.append(filters["port"])
+    return (" WHERE " + " AND ".join(clauses) if clauses else ""), parameters
+
+
+def load_analytics(settings, filters):
+    where, parameters = build_where(filters)
+    with connect_database(settings) as connection, connection.cursor() as cursor:
+        def query(sql, columns, prefix=()):
+            cursor.execute(sql, [*prefix, *parameters])
+            return pd.DataFrame(cursor.fetchall(), columns=columns)
+
+        labels = query(
+            "SELECT original_label, COUNT(*), MIN(observed_at), MAX(observed_at) FROM network_flows"
+            + where + " GROUP BY original_label ORDER BY COUNT(*) DESC, original_label",
+            ["original_label", "flow_count", "first_seen", "last_seen"],
+        )
+        labels = prepare_label_summary(labels.itertuples(index=False, name=None))
+        protocols = query(
+            f"SELECT protocol, {TRAFFIC_CLASS_SQL} AS traffic_class, COUNT(*) FROM network_flows"
+            + where + " GROUP BY protocol, traffic_class ORDER BY COUNT(*) DESC",
+            ["protocol", "traffic_class", "flow_count"],
+        )
+        ports = query(
+            "SELECT protocol, destination_port, COUNT(*) AS flows, "
+            f"COUNT(*) FILTER (WHERE ({TRAFFIC_CLASS_SQL}) = 'Labeled attack') AS attacks "
+            "FROM network_flows" + where
+            + " GROUP BY protocol, destination_port ORDER BY flows DESC, protocol, destination_port LIMIT 20",
+            ["protocol", "destination_port", "flow_count", "attack_count"],
+        )
+        connections = query(
+            "SELECT source_ip::text, destination_ip::text, protocol, destination_port, COUNT(*) AS flows, "
+            f"COUNT(*) FILTER (WHERE ({TRAFFIC_CLASS_SQL}) = 'Labeled attack'), "
+            "MIN(observed_at), MAX(observed_at) FROM network_flows" + where
+            + " GROUP BY source_ip, destination_ip, protocol, destination_port "
+            "ORDER BY flows DESC, source_ip, destination_ip, protocol, destination_port LIMIT 200",
+            ["source_ip", "destination_ip", "protocol", "destination_port", "flow_count", "attack_count", "first_seen", "last_seen"],
+        )
+        timeline = query(
+            "SELECT date_bin(%s::interval, observed_at, TIMESTAMP '2000-01-01') AS time_bucket, "
+            f"{TRAFFIC_CLASS_SQL} AS traffic_class, COUNT(*) FROM network_flows" + where
+            + (" AND " if where else " WHERE ") + "observed_at IS NOT NULL "
+            "GROUP BY time_bucket, traffic_class ORDER BY time_bucket, traffic_class",
+            ["time_bucket", "traffic_class", "flow_count"], [INTERVALS[filters["interval"]]],
+        )
+        # Separate categories retain the original dataset attack names.
+        attack_timeline = query(
+            "SELECT date_bin(%s::interval, observed_at, TIMESTAMP '2000-01-01') AS time_bucket, "
+            "original_label, COUNT(*) FROM network_flows" + where
+            + (" AND " if where else " WHERE ")
+            + f"observed_at IS NOT NULL AND ({TRAFFIC_CLASS_SQL}) = 'Labeled attack' "
+            "GROUP BY time_bucket, original_label ORDER BY time_bucket, original_label",
+            ["time_bucket", "original_label", "flow_count"], [INTERVALS[filters["interval"]]],
+        )
+    return dict(labels=labels, protocols=protocols, ports=ports, connections=connections,
+                timeline=timeline, attack_timeline=attack_timeline)
+
+
+def protocol_name(value):
+    return "Unknown" if pd.isna(value) else PROTOCOLS.get(int(value), f"Protocol {int(value)}")
+
+
+def export_table(frame, filename):
+    st.dataframe(frame, hide_index=True, width="stretch")
+    st.download_button("Download CSV", frame.to_csv(index=False).encode("utf-8-sig"),
+                       file_name=filename, mime="text/csv", key=filename)
+
+
+def render_connections(result):
+    st.subheader("Traffic by protocol")
+    protocols = result["protocols"].copy()
+    if protocols.empty:
+        st.info("No flows match the applied filters.")
+        return
+    protocols["protocol_name"] = protocols["protocol"].map(protocol_name)
+    st.plotly_chart(px.bar(protocols, x="protocol_name", y="flow_count", color="traffic_class",
+                          color_discrete_map=COLORS, labels={"protocol_name": "Protocol", "flow_count": "Flows"}), width="stretch")
+    st.subheader("Top 20 destination ports by flow count")
+    ports = result["ports"].copy()
+    ports["connection_type"] = ports.apply(lambda row: f"{protocol_name(row['protocol'])} / port {int(row['destination_port']) if pd.notna(row['destination_port']) else 'unknown'}", axis=1)
+    st.caption("Transport protocol and destination port grouped.")
+    st.plotly_chart(px.bar(ports, x="flow_count", y="connection_type", orientation="h",
+                          color_discrete_sequence=[COLORS["Benign"]],
+                          hover_data=["attack_count"], labels={"flow_count": "Flows", "connection_type": ""})
+                    .update_layout(yaxis=dict(autorange="reversed")), width="stretch")
+    export_table(ports, "zeng_port_summary.csv")
+    st.subheader("Top 200 communication patterns")
+    st.caption("Grouped by protocol and destination port. Source ports are combined.")
+    frame = result["connections"].copy()
+    export_table(frame, "zeng_connection_patterns.csv")
+
+
+def render_time(result, interval):
+    st.subheader("Traffic over time")
+    timeline = result["timeline"]
+    if timeline.empty:
+        st.info("No timestamped flows match the applied filters.")
+        return
+    # Reindex empty buckets to prevent lines bridging unrecorded periods.
+    for frame, category, title in [
+        (timeline, "traffic_class", "Benign and labeled attack traffic"),
+        (result["attack_timeline"], "original_label", "Labeled attack categories over time"),
+    ]:
+        st.write(title)
+        if frame.empty:
+            st.info("No labeled attacks in the selected traffic.")
+            continue
+        grid = pd.date_range(timeline.time_bucket.min(), timeline.time_bucket.max(),
+                             freq={"5 minutes": "5min", "15 minutes": "15min", "1 hour": "1h", "1 day": "1D"}[interval])
+        wide = frame.pivot(index="time_bucket", columns=category, values="flow_count").reindex(grid).fillna(0)
+        wide.index.name = "time_bucket"
+        chart = wide.reset_index().melt(id_vars="time_bucket", var_name=category, value_name="flow_count")
+        st.plotly_chart(px.line(chart, x="time_bucket", y="flow_count", color=category,
+                               color_discrete_map=COLORS if category == "traffic_class" else None,
+                               labels={"time_bucket": "Recorded time", "flow_count": "Flows"}), width="stretch")
+    export_table(timeline, "zeng_traffic_timeline.csv")
+
+
 def main():
-    # Main page display config 
     st.set_page_config(page_title="Network Traffic Overview", page_icon="Z")
     st.caption("Z-ENG: Network Intrusion Detection and Security Analytics Dashboard")
     st.title("Network Traffic Overview")
-    
-    #TODO: currently we use the dataset's original labels, model predictions to be added later :)
-
     with st.sidebar:
         st.header("Connect to the Database")
         with st.form("database_connection"):
-            # TODO: Decide if leaving already declared values or remove all (or only pswrd) for security?
             host = st.text_input("Host", value="localhost")
             port = st.number_input("Port", min_value=1, max_value=65535, value=5432)
             database = st.text_input("Database name", value="zeng_security")
             username = st.text_input("Username", value="postgres")
-            password = st.text_input("Password", type="password", value="holahola") 
+            password = st.text_input("Password", type="password")
             submitted = st.form_submit_button("Connect")
-
     if submitted:
-        st.session_state.pop("analytics_result", None)
+        for key in ["analytics_result", "filter_options", "db_settings", "applied_filters"]:
+            st.session_state.pop(key, None)
+        settings = dict(host=host, port=int(port), dbname=database, user=username, password=password)
         try:
-            # Appears while loading the database first
-            with st.spinner("Calculating summaries in the database..."):
-                labels, imports = load_summaries(host, int(port), database, username, password)
-            st.session_state["analytics_result"] = {
-                "labels": labels, "imports": imports,
-                "loaded_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-                "target": f"{database} on {host}:{int(port)}",
-            }
-        # If the data for connecting to the database was not correct throw an error:
-        except psycopg.OperationalError:
-            st.error("Error: Check data submmited for the database connection.")
-
-    result = st.session_state.get("analytics_result")
-    if result is None:
+            with st.spinner("Reading database filters..."):
+                options = load_filter_options(settings)
+            st.session_state["db_settings"] = settings
+            st.session_state["filter_options"] = options
+        except psycopg.Error:
+            st.error("Could not read the database. Check the connection details, schema, and PostgreSQL server.")
+    if "db_settings" not in st.session_state:
         st.write("Enter your database connection details in the sidebar, then click **Connect**.")
         return
-
-    st.caption(f"Database source: {result['target']}")
-
-    render_overview(result["labels"], result["imports"])
+    imports, protocols, labels, bounds = st.session_state["filter_options"]
+    with st.sidebar:
+        st.header("Traffic filters")
+        st.caption("Empty selections include all values. Apply filters to update every view.")
+        with st.form("traffic_filters"):
+            names = dict(zip(imports.batch_id, imports.source_file))
+            batches = st.multiselect("Imported files", imports.batch_id.tolist(), format_func=lambda x: f"{x}: {names[x]}")
+            selected_protocols = st.multiselect("Protocols", protocols, format_func=protocol_name)
+            selected_labels = st.multiselect("Source labels", labels)
+            limit_port = st.checkbox("Filter destination port")
+            destination_port = st.number_input("Destination port", 0, 65535, 443)
+            limit_time = st.checkbox("Filter recorded time")
+            minimum, maximum = bounds
+            fallback = datetime(2017, 7, 3)
+            start = st.text_input("Start (inclusive)", value=str(minimum or fallback), help="YYYY-MM-DD HH:MM:SS")
+            end = st.text_input("End (exclusive)", value=str((maximum + pd.Timedelta(seconds=1)) if maximum else fallback), help="YYYY-MM-DD HH:MM:SS")
+            interval = st.selectbox("Time interval", list(INTERVALS), index=2)
+            apply = st.form_submit_button("Apply filters / refresh")
+    if apply or "analytics_result" not in st.session_state:
+        try:
+            start_value = datetime.fromisoformat(start) if limit_time else None
+            end_value = datetime.fromisoformat(end) if limit_time else None
+            if limit_time and (start_value.tzinfo is not None or end_value.tzinfo is not None or start_value >= end_value):
+                raise ValueError("Use a start earlier than the end, with no time-zone offset.")
+        except ValueError:
+            st.error("Enter valid timestamps (YYYY-MM-DD HH:MM:SS), with start before end and no time-zone offset.")
+            return
+        filters = dict(batches=batches, protocols=selected_protocols, labels=selected_labels,
+                       port=int(destination_port) if limit_port else None,
+                       start=start_value, end=end_value, interval=interval)
+        try:
+            with st.spinner("Calculating filtered summaries in PostgreSQL..."):
+                result = load_analytics(st.session_state["db_settings"], filters)
+            st.session_state["analytics_result"] = result
+            st.session_state["applied_filters"] = filters
+            st.session_state["loaded_at"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        except psycopg.Error:
+            st.error("The analytics query failed or exceeded 120 seconds. Check the database and try a smaller selection.")
+            return
+    result = st.session_state["analytics_result"]
+    applied = st.session_state["applied_filters"]
+    settings = st.session_state["db_settings"]
+    st.caption(f"Database source: {settings['dbname']} on {settings['host']}:{settings['port']} · Loaded {st.session_state['loaded_at']}")
+    with st.expander("Applied filters", expanded=False):
+        st.write({k: str(v) for k, v in applied.items()})
+    overview, connections, time = st.tabs(["Overview", "Protocols & connections", "Time analysis"])
+    with overview:
+        render_overview(result["labels"], imports)
+    with connections:
+        render_connections(result)
+    with time:
+        render_time(result, applied["interval"])
 
 
 if __name__ == "__main__":
+
+
     main()
